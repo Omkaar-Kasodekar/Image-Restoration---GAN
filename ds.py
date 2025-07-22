@@ -3,7 +3,7 @@ from PIL import Image
 import io
 import os
 
-dataset = load_dataset("huggan/night2day", split="train").select(range(1000))
+dataset = load_dataset("huggan/night2day", split="train").select(range(20120))
 
 # Save images locally
 os.makedirs("./night2day/night", exist_ok=True)
