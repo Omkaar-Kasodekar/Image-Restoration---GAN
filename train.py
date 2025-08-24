@@ -257,7 +257,7 @@ def calculate_fid(generator, val_loader, device, epoch, out_dir):
 # ============================
 def train(night_dir, day_dir, out_dir="./runs", 
           epochs=100, batch_size=8, lr=2e-4, device=None,
-          debug=True, debug_subset_size=500, l1_lambda=100.0,
+          debug=True, debug_subset_size=2000, l1_lambda=100.0,
           eval_every=5): # ### LPIPS / FID ###: Evaluate every N epochs
 
     os.makedirs(out_dir, exist_ok=True)
