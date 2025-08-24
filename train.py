@@ -1,24 +1,31 @@
 # ==============================================================================
-# Pix2Pix for Night-to-Day Image Translation with FID Evaluation
+# Pix2Pix for Night-to-Day Image Translation with FID & LPIPS Evaluation
 #
 # Description:
 # This script implements a Pix2Pix Generative Adversarial Network (GAN) to
 # translate night-time images into day-time images. It uses a U-Net generator
 # and a PatchGAN discriminator.
 #
-# Evaluation Metric:
-# Instead of using pixel-based metrics like PSNR or SSIM, which are not ideal
-# for GANs, this script uses Fréchet Inception Distance (FID) to measure the
-# quality and diversity of the generated images. A lower FID score is better.
+# Evaluation Metrics:
+# This script uses two powerful perceptual metrics:
+# 1. Fréchet Inception Distance (FID): Measures the quality and diversity of
+#    the generated images by comparing their feature distributions to real
+#    images. Lower is better.
+# 2. Learned Perceptual Image Patch Similarity (LPIPS): Measures the
+#    perceptual similarity between paired generated and real images.
+#    Lower is better.
 #
 # Dependencies:
 # - PyTorch
 # - Torchvision
 # - Pillow (PIL)
 # - torch-fidelity (for FID calculation)
+# - lpips (for LPIPS calculation)
 #
-# To install torch-fidelity:
+# To install dependencies:
+# pip install torch torchvision Pillow
 # pip install torch-fidelity
+# pip install lpips
 # ==============================================================================
 
 import os
@@ -32,6 +39,7 @@ from torch.utils.data import Dataset, DataLoader, Subset
 from torchvision.utils import save_image
 import torchvision.transforms as T
 from PIL import Image
+import lpips # ### LPIPS ###: Import the lpips library
 
 # ============================
 # Generator (U-Net)
@@ -176,29 +184,49 @@ class PairedDayNightDataset(Dataset):
 
 
 # ============================
-# Utilities
+# Utilities & Evaluation
 # ============================
 @torch.no_grad()
 def denorm(x):
     # Denormalize tensor from [-1, 1] to [0, 1] for saving/viewing
     return (x + 1) / 2.0
 
-### FID ###
+# ### LPIPS ###
+# This function calculates the average LPIPS score between generated images
+# and their corresponding ground truth images from the validation set.
+@torch.no_grad()
+def calculate_lpips(generator, val_loader, loss_fn_lpips, device, epoch):
+    print(f"--- Calculating LPIPS for epoch {epoch} ---")
+    generator.eval()
+    
+    lpips_scores = []
+    for night, day in val_loader:
+        night, day = night.to(device), day.to(device)
+        fake_day = generator(night)
+        
+        # LPIPS model expects input in range [-1, 1], which our data already is.
+        dist = loss_fn_lpips(fake_day, day)
+        lpips_scores.extend(dist.cpu().numpy())
+    
+    avg_lpips = sum(lpips_scores) / len(lpips_scores)
+    print(f"LPIPS Score: {avg_lpips:.4f}")
+    
+    generator.train()
+    return avg_lpips
+
+# ### FID ###
 # This function calculates the FID score between a set of generated images
-# and a set of real images. It saves both sets to temporary directories
-# and uses the `torch-fidelity` library to compute the score.
+# and a set of real images.
 @torch.no_grad()
 def calculate_fid(generator, val_loader, device, epoch, out_dir):
     print(f"--- Calculating FID for epoch {epoch} ---")
     generator.eval()
 
-    # Create temporary directories for generated and real images
     gen_dir = os.path.join(out_dir, "fid_generated")
     real_dir = os.path.join(out_dir, "fid_real")
     os.makedirs(gen_dir, exist_ok=True)
     os.makedirs(real_dir, exist_ok=True)
 
-    # Save generated and real images
     for i, (night, day) in enumerate(val_loader):
         night = night.to(device)
         fake_day = generator(night)
@@ -208,29 +236,20 @@ def calculate_fid(generator, val_loader, device, epoch, out_dir):
             save_image(denorm(fake_day[j]), os.path.join(gen_dir, f"{img_num:04d}.png"))
             save_image(denorm(day[j]), os.path.join(real_dir, f"{img_num:04d}.png"))
 
-    # Calculate FID using the torch-fidelity command-line tool
     print("Running FID calculation... This may take a moment.")
     try:
-        # Construct the command
-        cmd = [
-            "fidelity", "--gpu", "0", "--fid",
-            "--input1", real_dir,
-            "--input2", gen_dir
-        ]
-        # Execute the command
+        cmd = ["fidelity", "--gpu", "0", "--fid", "--input1", real_dir, "--input2", gen_dir]
         result = subprocess.check_output(cmd, universal_newlines=True)
-        # Parse the output to get the FID score
         fid_score = float(result.strip())
         print(f"FID Score: {fid_score:.4f}")
     except Exception as e:
         print(f"Error calculating FID: {e}")
-        fid_score = float('inf') # Return a high value on error
+        fid_score = float('inf')
     finally:
-        # Clean up temporary directories
         shutil.rmtree(gen_dir)
         shutil.rmtree(real_dir)
     
-    generator.train() # Set model back to train mode
+    generator.train()
     return fid_score
 
 # ============================
@@ -239,39 +258,33 @@ def calculate_fid(generator, val_loader, device, epoch, out_dir):
 def train(night_dir, day_dir, out_dir="./runs", 
           epochs=100, batch_size=8, lr=2e-4, device=None,
           debug=True, debug_subset_size=500, l1_lambda=100.0,
-          fid_every=5): # ### FID ###: Calculate FID every 5 epochs
+          eval_every=5): # ### LPIPS / FID ###: Evaluate every N epochs
 
     os.makedirs(out_dir, exist_ok=True)
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # Load dataset
     dataset = PairedDayNightDataset(night_dir, day_dir)
 
-    # Use a subset if in debug mode for faster iteration
     if debug:
         dataset = Subset(dataset, range(min(debug_subset_size, len(dataset))))
         print(f"[DEBUG MODE] Using {len(dataset)} images for quick testing.")
 
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
-    # ### FID ###: Create a validation loader for consistent FID calculation
     val_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
 
-
-    # Initialize models
     G = Generator().to(device)
     D = Discriminator().to(device)
 
-    # Optimizers
     opt_G = optim.Adam(G.parameters(), lr=lr, betas=(0.5, 0.999))
     opt_D = optim.Adam(D.parameters(), lr=lr, betas=(0.5, 0.999))
 
-    # Loss functions
     bce_loss = nn.BCEWithLogitsLoss()
     l1_loss = nn.L1Loss()
-    
-    # ### FID ###: Keep track of the best FID score
+    loss_fn_lpips = lpips.LPIPS(net='alex').to(device) # ### LPIPS ###: Initialize LPIPS model
+
     best_fid = float('inf')
+    best_lpips = float('inf') # ### LPIPS ###: Keep track of the best LPIPS score
 
     for epoch in range(1, epochs + 1):
         G.train()
@@ -314,11 +327,9 @@ def train(night_dir, day_dir, out_dir="./runs",
                       f"D_loss: {loss_D.item():.4f} | G_loss: {loss_G.item():.4f} | "
                       f"G_gan: {loss_G_gan.item():.4f} | G_l1: {loss_G_l1.item():.4f}")
 
-        # --- End of Epoch Summary ---
         print(f"[Epoch {epoch} Summary] "
               f"Avg D_loss: {d_loss_total/len(loader):.4f} | Avg G_loss: {g_loss_total/len(loader):.4f}")
 
-        # Save sample images (input, generated, ground_truth)
         eval_night, eval_day = next(iter(val_loader))
         eval_night, eval_day = eval_night.to(device), eval_day.to(device)
         with torch.no_grad():
@@ -326,39 +337,42 @@ def train(night_dir, day_dir, out_dir="./runs",
         save_image(torch.cat([denorm(eval_night[:8]), denorm(fake_eval[:8]), denorm(eval_day[:8])], dim=0),
                    os.path.join(out_dir, f"epoch_{epoch:03d}_samples.png"), nrow=8)
 
-        # ### FID ###: Calculate and log FID score periodically
-        if epoch % fid_every == 0 or epoch == epochs:
+        # ### LPIPS / FID ###: Calculate and log scores periodically
+        if epoch % eval_every == 0 or epoch == epochs:
             current_fid = calculate_fid(G, val_loader, device, epoch, out_dir)
+            current_lpips = calculate_lpips(G, val_loader, loss_fn_lpips, device, epoch)
+            
             if current_fid < best_fid:
                 best_fid = current_fid
-                print(f"✨ New best FID: {best_fid:.4f}. Saving model. ✨")
-                torch.save(G.state_dict(), os.path.join(out_dir, "generator_best.pth"))
-                torch.save(D.state_dict(), os.path.join(out_dir, "discriminator_best.pth"))
+                print(f"✨ New best FID: {best_fid:.4f}. Saving FID-best model. ✨")
+                torch.save(G.state_dict(), os.path.join(out_dir, "generator_best_fid.pth"))
+            
+            # ### LPIPS ###: Check for best LPIPS and save model
+            if current_lpips < best_lpips:
+                best_lpips = current_lpips
+                print(f"✨ New best LPIPS: {best_lpips:.4f}. Saving LPIPS-best model. ✨")
+                torch.save(G.state_dict(), os.path.join(out_dir, "generator_best_lpips.pth"))
 
-    print("Training finished.")
+    print("\n--- Training finished ---")
     print(f"Best FID score achieved: {best_fid:.4f}")
+    print(f"Best LPIPS score achieved: {best_lpips:.4f}")
     return G, D
 
 # ============================
 # Example Run
 # ============================
 if __name__ == "__main__":
-    # IMPORTANT: Create these directories and place your paired images inside.
-    # The filenames in both directories must match.
-    # e.g., night/001.jpg and day/001.jpg
     NIGHT_DIR = "night2day/night"
     DAY_DIR   = "night2day/day"
     
-    # Create dummy directories and images for testing if they don't exist
     if not os.path.exists(NIGHT_DIR) or not os.path.exists(DAY_DIR):
         print("Creating dummy data for testing purposes...")
         os.makedirs(NIGHT_DIR, exist_ok=True)
         os.makedirs(DAY_DIR, exist_ok=True)
-        for i in range(50): # Create a few more dummy images
+        for i in range(50):
             dummy_night = Image.new('RGB', (256, 256), color = (10+i, 20+i, 40+i%20))
             dummy_day = Image.new('RGB', (256, 256), color = (150-i, 180-i, 200-i%30))
             dummy_night.save(os.path.join(NIGHT_DIR, f"{i:03d}.png"))
             dummy_day.save(os.path.join(DAY_DIR, f"{i:03d}.png"))
 
-    # Start training
-    train(NIGHT_DIR, DAY_DIR, out_dir="./pix2pix_fid_runs", epochs=100, batch_size=8)
+    train(NIGHT_DIR, DAY_DIR, out_dir="./pix2pix_fid_lpips_runs", epochs=100, batch_size=8, eval_every=5)
