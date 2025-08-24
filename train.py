@@ -1,0 +1,364 @@
+# ==============================================================================
+# Pix2Pix for Night-to-Day Image Translation with FID Evaluation
+#
+# Description:
+# This script implements a Pix2Pix Generative Adversarial Network (GAN) to
+# translate night-time images into day-time images. It uses a U-Net generator
+# and a PatchGAN discriminator.
+#
+# Evaluation Metric:
+# Instead of using pixel-based metrics like PSNR or SSIM, which are not ideal
+# for GANs, this script uses Fréchet Inception Distance (FID) to measure the
+# quality and diversity of the generated images. A lower FID score is better.
+#
+# Dependencies:
+# - PyTorch
+# - Torchvision
+# - Pillow (PIL)
+# - torch-fidelity (for FID calculation)
+#
+# To install torch-fidelity:
+# pip install torch-fidelity
+# ==============================================================================
+
+import os
+import glob
+import shutil
+import subprocess
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, Subset
+from torchvision.utils import save_image
+import torchvision.transforms as T
+from PIL import Image
+
+# ============================
+# Generator (U-Net)
+# ============================
+class Generator(nn.Module):
+    def __init__(self):
+        super(Generator, self).__init__()
+        # Encoder (Down-sampling path)
+        self.down1 = self._conv_block(3, 64, first_block=True)
+        self.down2 = self._conv_block(64, 128)
+        self.down3 = self._conv_block(128, 256)
+        self.down4 = self._conv_block(256, 512)
+        
+        # Bottleneck
+        self.bottleneck = self._conv_block(512, 512)
+
+        # Decoder (Up-sampling path)
+        self.up_conv1 = self._up_conv(512, 512)
+        self.up_block1 = self._conv_block(512 + 512, 256) # Cat(up_conv1, d4)
+        
+        self.up_conv2 = self._up_conv(256, 256)
+        self.up_block2 = self._conv_block(256 + 256, 128) # Cat(up_conv2, d3)
+        
+        self.up_conv3 = self._up_conv(128, 128)
+        self.up_block3 = self._conv_block(128 + 128, 64)  # Cat(up_conv3, d2)
+
+        self.up_conv4 = self._up_conv(64, 64)
+        self.up_block4 = self._conv_block(64 + 64, 64)   # Cat(up_conv4, d1)
+
+        # Final convolution to produce the 3-channel RGB image
+        self.final_conv = nn.Conv2d(64, 3, kernel_size=1)
+        
+        # MaxPool for down-sampling in the encoder
+        self.pool = nn.MaxPool2d(2)
+
+    def _conv_block(self, in_channels, out_channels, first_block=False):
+        # A standard convolutional block with two conv layers
+        layers = [
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.LeakyReLU(0.2, inplace=True)
+        ]
+        return nn.Sequential(*layers)
+
+    def _up_conv(self, in_channels, out_channels):
+        # A single transpose convolution to up-sample feature maps
+        return nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2)
+
+    def forward(self, x):
+        # --- Encoder Path ---
+        d1 = self.down1(x)
+        d2 = self.down2(self.pool(d1))
+        d3 = self.down3(self.pool(d2))
+        d4 = self.down4(self.pool(d3))
+
+        # --- Bottleneck ---
+        b = self.bottleneck(self.pool(d4))
+
+        # --- Decoder Path with Skip Connections ---
+        u1 = self.up_conv1(b)
+        u1 = torch.cat([u1, d4], dim=1)
+        u1 = self.up_block1(u1)
+
+        u2 = self.up_conv2(u1)
+        u2 = torch.cat([u2, d3], dim=1)
+        u2 = self.up_block2(u2)
+
+        u3 = self.up_conv3(u2)
+        u3 = torch.cat([u3, d2], dim=1)
+        u3 = self.up_block3(u3)
+
+        u4 = self.up_conv4(u3)
+        u4 = torch.cat([u4, d1], dim=1)
+        u4 = self.up_block4(u4)
+
+        # Final output layer
+        out = self.final_conv(u4)
+        
+        # Use tanh activation to scale output to [-1, 1]
+        return torch.tanh(out)
+
+
+# ============================
+# Discriminator (PatchGAN)
+# ============================
+class Discriminator(nn.Module):
+    def __init__(self, in_channels=6):  # Input: concat(night_image, day_image)
+        super(Discriminator, self).__init__()
+
+        def block(ic, oc, use_bn=True):
+            layers = [nn.Conv2d(ic, oc, kernel_size=4, stride=2, padding=1, bias=False)]
+            if use_bn:
+                layers.append(nn.BatchNorm2d(oc))
+            layers.append(nn.LeakyReLU(0.2, inplace=True))
+            return nn.Sequential(*layers)
+
+        self.main = nn.Sequential(
+            block(in_channels, 64, use_bn=False),
+            block(64, 128),
+            block(128, 256),
+            block(256, 512),
+            nn.Conv2d(512, 1, kernel_size=4, stride=1, padding=1)  # Output logits
+        )
+
+    def forward(self, x):
+        return self.main(x)
+
+
+# ============================
+# Dataset Loader
+# ============================
+class PairedDayNightDataset(Dataset):
+    def __init__(self, night_dir, day_dir, image_size=256):
+        self.night_paths = sorted(glob.glob(os.path.join(night_dir, "*")))
+        self.day_dir = day_dir
+        self.image_size = image_size
+        self.transform = T.Compose([
+            T.Resize((image_size, image_size)),
+            T.ToTensor(),
+            T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]) # Normalize to [-1, 1]
+        ])
+
+    def __len__(self):
+        return len(self.night_paths)
+
+    def __getitem__(self, idx):
+        night_path = self.night_paths[idx]
+        fname = os.path.basename(night_path)
+        day_path = os.path.join(self.day_dir, fname)
+
+        try:
+            night_img = Image.open(night_path).convert("RGB")
+            day_img = Image.open(day_path).convert("RGB")
+        except FileNotFoundError:
+            print(f"Warning: Corresponding day image not found for {fname}. Skipping.")
+            return self.__getitem__((idx + 1) % len(self))
+
+        return self.transform(night_img), self.transform(day_img)
+
+
+# ============================
+# Utilities
+# ============================
+@torch.no_grad()
+def denorm(x):
+    # Denormalize tensor from [-1, 1] to [0, 1] for saving/viewing
+    return (x + 1) / 2.0
+
+### FID ###
+# This function calculates the FID score between a set of generated images
+# and a set of real images. It saves both sets to temporary directories
+# and uses the `torch-fidelity` library to compute the score.
+@torch.no_grad()
+def calculate_fid(generator, val_loader, device, epoch, out_dir):
+    print(f"--- Calculating FID for epoch {epoch} ---")
+    generator.eval()
+
+    # Create temporary directories for generated and real images
+    gen_dir = os.path.join(out_dir, "fid_generated")
+    real_dir = os.path.join(out_dir, "fid_real")
+    os.makedirs(gen_dir, exist_ok=True)
+    os.makedirs(real_dir, exist_ok=True)
+
+    # Save generated and real images
+    for i, (night, day) in enumerate(val_loader):
+        night = night.to(device)
+        fake_day = generator(night)
+        
+        for j in range(fake_day.size(0)):
+            img_num = i * val_loader.batch_size + j
+            save_image(denorm(fake_day[j]), os.path.join(gen_dir, f"{img_num:04d}.png"))
+            save_image(denorm(day[j]), os.path.join(real_dir, f"{img_num:04d}.png"))
+
+    # Calculate FID using the torch-fidelity command-line tool
+    print("Running FID calculation... This may take a moment.")
+    try:
+        # Construct the command
+        cmd = [
+            "fidelity", "--gpu", "0", "--fid",
+            "--input1", real_dir,
+            "--input2", gen_dir
+        ]
+        # Execute the command
+        result = subprocess.check_output(cmd, universal_newlines=True)
+        # Parse the output to get the FID score
+        fid_score = float(result.strip())
+        print(f"FID Score: {fid_score:.4f}")
+    except Exception as e:
+        print(f"Error calculating FID: {e}")
+        fid_score = float('inf') # Return a high value on error
+    finally:
+        # Clean up temporary directories
+        shutil.rmtree(gen_dir)
+        shutil.rmtree(real_dir)
+    
+    generator.train() # Set model back to train mode
+    return fid_score
+
+# ============================
+# Training Loop
+# ============================
+def train(night_dir, day_dir, out_dir="./runs", 
+          epochs=100, batch_size=8, lr=2e-4, device=None,
+          debug=True, debug_subset_size=500, l1_lambda=100.0,
+          fid_every=5): # ### FID ###: Calculate FID every 5 epochs
+
+    os.makedirs(out_dir, exist_ok=True)
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    # Load dataset
+    dataset = PairedDayNightDataset(night_dir, day_dir)
+
+    # Use a subset if in debug mode for faster iteration
+    if debug:
+        dataset = Subset(dataset, range(min(debug_subset_size, len(dataset))))
+        print(f"[DEBUG MODE] Using {len(dataset)} images for quick testing.")
+
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    # ### FID ###: Create a validation loader for consistent FID calculation
+    val_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+
+
+    # Initialize models
+    G = Generator().to(device)
+    D = Discriminator().to(device)
+
+    # Optimizers
+    opt_G = optim.Adam(G.parameters(), lr=lr, betas=(0.5, 0.999))
+    opt_D = optim.Adam(D.parameters(), lr=lr, betas=(0.5, 0.999))
+
+    # Loss functions
+    bce_loss = nn.BCEWithLogitsLoss()
+    l1_loss = nn.L1Loss()
+    
+    # ### FID ###: Keep track of the best FID score
+    best_fid = float('inf')
+
+    for epoch in range(1, epochs + 1):
+        G.train()
+        D.train()
+        g_loss_total, d_loss_total = 0.0, 0.0
+        print(f"\n--- Starting Epoch {epoch}/{epochs} ---")
+
+        for i, (night, day) in enumerate(loader, 1):
+            night, day = night.to(device), day.to(device)
+
+            # --- Train Discriminator ---
+            opt_D.zero_grad()
+            fake_day = G(night).detach()
+            real_pair = torch.cat([night, day], dim=1)
+            d_real_logits = D(real_pair)
+            loss_D_real = bce_loss(d_real_logits, torch.ones_like(d_real_logits))
+            fake_pair = torch.cat([night, fake_day], dim=1)
+            d_fake_logits = D(fake_pair)
+            loss_D_fake = bce_loss(d_fake_logits, torch.zeros_like(d_fake_logits))
+            loss_D = (loss_D_real + loss_D_fake) * 0.5
+            loss_D.backward()
+            opt_D.step()
+
+            # --- Train Generator ---
+            opt_G.zero_grad()
+            fake_day_for_g = G(night)
+            fake_pair_for_g = torch.cat([night, fake_day_for_g], dim=1)
+            d_fake_logits_for_g = D(fake_pair_for_g)
+            loss_G_gan = bce_loss(d_fake_logits_for_g, torch.ones_like(d_fake_logits_for_g))
+            loss_G_l1 = l1_loss(fake_day_for_g, day) * l1_lambda
+            loss_G = loss_G_gan + loss_G_l1
+            loss_G.backward()
+            opt_G.step()
+
+            g_loss_total += loss_G.item()
+            d_loss_total += loss_D.item()
+
+            if i % 50 == 0 or i == len(loader):
+                print(f"Epoch {epoch} | Batch {i}/{len(loader)} | "
+                      f"D_loss: {loss_D.item():.4f} | G_loss: {loss_G.item():.4f} | "
+                      f"G_gan: {loss_G_gan.item():.4f} | G_l1: {loss_G_l1.item():.4f}")
+
+        # --- End of Epoch Summary ---
+        print(f"[Epoch {epoch} Summary] "
+              f"Avg D_loss: {d_loss_total/len(loader):.4f} | Avg G_loss: {g_loss_total/len(loader):.4f}")
+
+        # Save sample images (input, generated, ground_truth)
+        eval_night, eval_day = next(iter(val_loader))
+        eval_night, eval_day = eval_night.to(device), eval_day.to(device)
+        with torch.no_grad():
+            fake_eval = G(eval_night)
+        save_image(torch.cat([denorm(eval_night[:8]), denorm(fake_eval[:8]), denorm(eval_day[:8])], dim=0),
+                   os.path.join(out_dir, f"epoch_{epoch:03d}_samples.png"), nrow=8)
+
+        # ### FID ###: Calculate and log FID score periodically
+        if epoch % fid_every == 0 or epoch == epochs:
+            current_fid = calculate_fid(G, val_loader, device, epoch, out_dir)
+            if current_fid < best_fid:
+                best_fid = current_fid
+                print(f"✨ New best FID: {best_fid:.4f}. Saving model. ✨")
+                torch.save(G.state_dict(), os.path.join(out_dir, "generator_best.pth"))
+                torch.save(D.state_dict(), os.path.join(out_dir, "discriminator_best.pth"))
+
+    print("Training finished.")
+    print(f"Best FID score achieved: {best_fid:.4f}")
+    return G, D
+
+# ============================
+# Example Run
+# ============================
+if __name__ == "__main__":
+    # IMPORTANT: Create these directories and place your paired images inside.
+    # The filenames in both directories must match.
+    # e.g., night/001.jpg and day/001.jpg
+    NIGHT_DIR = "night2day/night"
+    DAY_DIR   = "night2day/day"
+    
+    # Create dummy directories and images for testing if they don't exist
+    if not os.path.exists(NIGHT_DIR) or not os.path.exists(DAY_DIR):
+        print("Creating dummy data for testing purposes...")
+        os.makedirs(NIGHT_DIR, exist_ok=True)
+        os.makedirs(DAY_DIR, exist_ok=True)
+        for i in range(50): # Create a few more dummy images
+            dummy_night = Image.new('RGB', (256, 256), color = (10+i, 20+i, 40+i%20))
+            dummy_day = Image.new('RGB', (256, 256), color = (150-i, 180-i, 200-i%30))
+            dummy_night.save(os.path.join(NIGHT_DIR, f"{i:03d}.png"))
+            dummy_day.save(os.path.join(DAY_DIR, f"{i:03d}.png"))
+
+    # Start training
+    train(NIGHT_DIR, DAY_DIR, out_dir="./pix2pix_fid_runs", epochs=100, batch_size=8)
