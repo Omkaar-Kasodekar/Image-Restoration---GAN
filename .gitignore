@@ -1,0 +1,15 @@
+# PyTorch model files
+*.pth
+*.pt
+
+# Output directories from training runs
+pix2pix_enhanced_runs/
+runs/
+
+# Python cache files
+__pycache__/
+*.pycgit restore --staged .gitignore
+image.png
+my_day_photo_generated.png
+pix2pix_enhanced_runs/
+*.png
